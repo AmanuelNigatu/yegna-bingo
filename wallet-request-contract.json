@@ -1,0 +1,19 @@
+{
+  "version": "V39",
+  "name": "Telegram Wallet + Secure Stake Integration",
+  "endpoint": "/api/wallet/requests",
+  "auth_header": "X-Wallet-Bot-Secret",
+  "request_types": [
+    "deposit",
+    "withdraw"
+  ],
+  "status_flow": [
+    "pending",
+    "approved",
+    "rejected"
+  ],
+  "identity": "telegram_numeric_user_id",
+  "idempotency_field": "reference",
+  "frontend_balance_mutation": false,
+  "withdrawal_policy": "hold_available_balance_on_request; finalize_on_approval; refund_on_rejection"
+}

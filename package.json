@@ -1,0 +1,28 @@
+{
+  "name": "yegna-bingo-mini-app",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:status": "node scripts/migrate.mjs --status",
+    "start": "node server/index.mjs"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-router-dom": "^7.0.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "vite": "^6.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
