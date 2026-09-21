@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: yegna-bingo-api
+    runtime: node
+    plan: free
+    buildCommand: npm install --no-audit --no-fund
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SUPER_ADMIN_TELEGRAM_ID
+        value: "801812169"
+      - key: DATABASE_URL
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: ALLOWED_ORIGIN
+        sync: false
+      - key: WALLET_BOT_SECRET
+        sync: false
+      - key: MINI_APP_URL
+        sync: false
+      - key: TELEGRAM_WEBHOOK_SECRET
+        sync: false
+      - key: TELEGRAM_INIT_DATA_MAX_AGE_SECONDS
+        value: "3600"
+      - key: TELEGRAM_INIT_DATA_FUTURE_SKEW_SECONDS
+        value: "60"
+      - key: SESSION_TTL_SECONDS
+        value: "86400"

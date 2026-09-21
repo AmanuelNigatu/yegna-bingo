@@ -2,7 +2,7 @@
 -- Safe to run after V42. Existing data is preserved.
 --
 -- 1) The bot conversation table is now also part of the canonical schema.
--- 2) The API route order is corrected so /api/bot/*
+-- 2) The Netlify route order is corrected in netlify.toml so /api/bot/*
 --    reaches the bot function instead of the general API function.
 -- 3) No game, wallet, UI, or reward behavior is changed by this migration.
 
