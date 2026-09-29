@@ -10,7 +10,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: SUPER_ADMIN_TELEGRAM_ID
-        value: "801812169"
+        sync: false
       - key: DATABASE_URL
         sync: false
       - key: TELEGRAM_BOT_TOKEN
