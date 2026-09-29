@@ -48,7 +48,7 @@ function menuKeyboard() {
 }
 
 async function upsertBotUser(tgUser, client) {
-  const role = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '') === String(tgUser.id) ? 'super_admin' : 'user';
+  const role = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '801812169') === String(tgUser.id) ? 'super_admin' : 'user';
   const r = await client.query(
     `INSERT INTO users(telegram_id,username,first_name,last_name,role)
      VALUES($1,$2,$3,$4,$5)
@@ -96,8 +96,8 @@ async function beginRequest(client, tgUser, action, chatId) {
   return tg('sendMessage', {
     chat_id: chatId,
     text: action === 'deposit'
-      ? '💰 Deposit\\n\\nEnter the amount in ETB (for example: 100):'
-      : '💸 Withdraw\\n\\nEnter the amount in ETB (for example: 100):',
+      ? '💰 Deposit\n\nEnter the amount in ETB (for example: 100):'
+      : '💸 Withdraw\n\nEnter the amount in ETB (for example: 100):',
     reply_markup: { force_reply: true }
   });
 }
@@ -105,20 +105,21 @@ async function beginRequest(client, tgUser, action, chatId) {
 async function handleText(client, msg, user) {
   const chatId = msg.chat.id;
   const text = String(msg.text || '').trim();
-  const conv = await getConversation(client, user.id);
+  const conv = await getConversation(client, user.telegram_id);
   if (!conv) return sendMenu(chatId, 'Choose an option below:');
 
   if (conv.step === 'amount') {
-    const amount = Number(text.replace(/,/g, ''));
-    if (!Number.isFinite(amount) || amount <= 0 || amount > 100000000) {
+    const amountText = text.trim();
+    const amount = Number(amountText.replace(/,/g, ''));
+    if (!/^(?:\d+|\d{1,3}(?:,\d{3})+)(?:\.\d{1,2})?$/.test(amountText) || !Number.isFinite(amount) || amount <= 0 || amount > 100000000) {
       return tg('sendMessage', { chat_id: chatId, text: 'Please enter a valid positive ETB amount.' });
     }
-    await setConversation(client, user.id, conv.action, 'detail', amount, null);
+    await setConversation(client, user.telegram_id, conv.action, 'detail', amount, null);
     return tg('sendMessage', {
       chat_id: chatId,
       text: conv.action === 'deposit'
-        ? `Deposit amount: ${money(amount)} ETB\\n\\nSend the payment/reference detail (for example transaction reference or method):`
-        : `Withdrawal amount: ${money(amount)} ETB\\n\\nSend the destination/method detail (for example Telebirr or bank account detail):`,
+        ? `Deposit amount: ${money(amount)} ETB\n\nSend the payment/reference detail (for example transaction reference or method):`
+        : `Withdrawal amount: ${money(amount)} ETB\n\nSend the destination/method detail (for example Telebirr or bank account detail):`,
       reply_markup: { force_reply: true }
     });
   }
@@ -127,10 +128,10 @@ async function handleText(client, msg, user) {
     if (text.length < 2 || text.length > 500) {
       return tg('sendMessage', { chat_id: chatId, text: 'Please enter a valid detail (2–500 characters).' });
     }
-    await setConversation(client, user.id, conv.action, 'confirm', conv.amount, text);
+    await setConversation(client, user.telegram_id, conv.action, 'confirm', conv.amount, text);
     return tg('sendMessage', {
       chat_id: chatId,
-      text: `${conv.action === 'deposit' ? '💰 Deposit' : '💸 Withdrawal'}\\nAmount: ${money(conv.amount)} ETB\\nDetail: ${text}\\n\\nConfirm this request?`,
+      text: `${conv.action === 'deposit' ? '💰 Deposit' : '💸 Withdrawal'}\nAmount: ${money(conv.amount)} ETB\nDetail: ${text}\n\nConfirm this request?`,
       reply_markup: { inline_keyboard: [[
         { text: '✅ Confirm', callback_data: 'confirm_request' },
         { text: '❌ Cancel', callback_data: 'cancel_request' }
@@ -194,7 +195,7 @@ async function handleCallback(client, query) {
     if (!conv || conv.step !== 'confirm') return sendMenu(chatId, 'This request has expired. Please start again.');
     const result = await createWalletRequest(client, user, conv);
     if (!result.ok) return sendMenu(chatId, `❌ ${result.error}`);
-    return sendMenu(chatId, `✅ ${conv.action === 'deposit' ? 'Deposit' : 'Withdrawal'} request submitted.\\nReference: ${result.request.reference_id}\\nStatus: Pending`);
+    return sendMenu(chatId, `✅ ${conv.action === 'deposit' ? 'Deposit' : 'Withdrawal'} request submitted.\nReference: ${result.request.reference_id}\nStatus: Pending`);
   }
   if (data === 'wallet') {
     const u = await upsertBotUser(user, client);
@@ -202,27 +203,11 @@ async function handleCallback(client, query) {
     return sendMenu(chatId, `💰 Current wallet balance: ${money(w.rows[0]?.balance || 0)} ETB`);
   }
   if (data === 'help') {
-    return sendMenu(chatId, 'YEGNA BINGO Help\\n\\n🎮 Open the Mini App to play.\\n💰 Deposit sends a request to Admin for approval.\\n💸 Withdraw reserves the amount and sends a request to Admin.\\n📋 Wallet shows your current balance.\\n\\nAdmin approval/rejection is handled in the Mini App.');
+    return sendMenu(chatId, 'YEGNA BINGO Help\n\n🎮 Open the Mini App to play.\n💰 Deposit sends a request to Admin for approval.\n💸 Withdraw reserves the amount and sends a request to Admin.\n📋 Wallet shows your current balance.\n\nAdmin approval/rejection is handled in the Mini App.');
   }
 }
 
 export async function handler(event) {
-  // GET is intentionally a safe health/diagnostic response. Telegram itself
-  // still delivers webhook updates with POST. This prevents the common
-  // confusion where opening the webhook URL in a browser appears broken.
-  if (event.httpMethod === 'GET') {
-    return json(200, {
-      ok: true,
-      service: 'yegna-bingo-telegram-bot',
-      webhookMethod: 'POST',
-      configured: {
-        botToken: Boolean(BOT_TOKEN),
-        database: Boolean(process.env.DATABASE_URL),
-        webhookSecret: Boolean(WEBHOOK_SECRET),
-        miniAppUrl: Boolean(MINI_APP_URL)
-      }
-    });
-  }
   if (event.httpMethod !== 'POST') return json(405, { error: 'POST only' });
   if (!BOT_TOKEN || !process.env.DATABASE_URL || !WEBHOOK_SECRET) return json(503, { error: 'Bot backend is not configured.' });
   if (!telegramSecretOk(event)) return json(401, { error: 'Invalid Telegram webhook secret.' });
@@ -237,7 +222,7 @@ export async function handler(event) {
       const user = await upsertBotUser(update.message.from, client);
       if (update.message.text === '/start') {
         await clearConversation(client, user.telegram_id);
-        await sendMenu(update.message.chat.id, `👋 Welcome to YEGNA BINGO, ${user.first_name || 'Player'}!\\n\\nYour Telegram account is securely linked to your wallet identity.`);
+        await sendMenu(update.message.chat.id, `👋 Welcome to YEGNA BINGO, ${user.first_name || 'Player'}!\n\nYour Telegram account is securely linked to your wallet identity.`);
       } else if (update.message.text === '/deposit') await beginRequest(client, user, 'deposit', update.message.chat.id);
       else if (update.message.text === '/withdraw') await beginRequest(client, user, 'withdrawal', update.message.chat.id);
       else await handleText(client, update.message, user);

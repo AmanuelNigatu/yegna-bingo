@@ -1,7 +1,7 @@
 const API_BASE = String(import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
 
 export function isBackendConfigured() {
-  return Boolean(import.meta.env.VITE_API_BASE_URL || window.location.hostname !== "localhost");
+  return Boolean(String(import.meta.env.VITE_API_BASE_URL || "").trim());
 }
 
 let sessionPromise = null;

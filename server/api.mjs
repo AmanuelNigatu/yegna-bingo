@@ -51,7 +51,7 @@ function logEvent(event, data = {}) {
 }
 const SESSION_COOKIE = 'yegna_session';
 const PICK_WINDOW_SECONDS = 35;
-const CALL_INTERVAL_MS = 3000;
+const CALL_INTERVAL_MS = 4000;
 const MAX_CATCH_UP_CALLS = 20;
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 86400);
 function cookieValue(event, name) {
@@ -64,13 +64,10 @@ function sessionHash(token) {
 }
 function sessionCookie(token) {
   const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  const sameSite = process.env.NODE_ENV === 'production' ? 'None' : 'Lax';
-  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=${SESSION_TTL_SECONDS}${secure}`;
+  return `${SESSION_COOKIE}=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=None; Max-Age=${SESSION_TTL_SECONDS}${secure}`;
 }
 function clearSessionCookie() {
-  const sameSite = process.env.NODE_ENV === 'production' ? 'None' : 'Lax';
-  const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=0${secure}`;
+  return `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=None; Secure; Max-Age=0`;
 }
 
 function verifyTelegramInitData(initData) {
@@ -128,7 +125,7 @@ async function createSession(req, client) {
 }
 
 async function upsertTelegramUser(tg, client) {
-  const superAdminId = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '').trim();
+  const superAdminId = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '801812169').trim();
   const configuredSuperAdmin = superAdminId && String(tg.id) === superAdminId;
   const existing = await client.query(`SELECT * FROM users WHERE telegram_id=$1`, [tg.id]);
   let role = configuredSuperAdmin ? 'super_admin' : (existing.rows[0]?.role === 'sub_admin' ? 'sub_admin' : 'user');
@@ -248,7 +245,14 @@ export async function handler(event) {
   try {
     const method = event.httpMethod;
     const parts = pathParts(event);
-    const body = event.body ? JSON.parse(event.body) : {};
+    let body = {};
+    if (event.body) {
+      try { body = JSON.parse(event.body); }
+      catch { return json(400, { error: 'Invalid JSON request body.' }); }
+      if (!body || typeof body !== 'object' || Array.isArray(body)) {
+        return json(400, { error: 'JSON request body must be an object.' });
+      }
+    }
 
     // One-time Telegram initData bootstrap. Protected API routes use the server session cookie after this.
     if (method === 'POST' && parts.at(-2) === 'auth' && parts.at(-1) === 'session') {
@@ -334,6 +338,8 @@ export async function handler(event) {
     }
 
     if (method === 'GET' && parts.at(-1) === 'wallet') {
+      // Regular users can only read the wallet belonging to the authenticated
+      // Telegram session. Never accept a client-supplied userId here.
       const w = await client.query(`SELECT w.balance, u.username, u.telegram_id FROM wallets w JOIN users u ON u.id=w.user_id WHERE w.user_id=$1`, [user.id]);
       const tx = await client.query(`SELECT id,type,amount,balance_after,detail,reference_id,created_at FROM wallet_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100`, [user.id]);
       return json(200, { wallet: w.rows[0], transactions: tx.rows });
@@ -353,7 +359,9 @@ export async function handler(event) {
         return json(200, r.rows[0]);
       }
       if (method === 'GET' && parts.at(-1) === 'user-wallet') {
-        if (!(await hasPermission(client, user, 'users_view'))) return json(403,{error:'Users permission required.'});
+        // Cross-user wallet visibility is restricted to authenticated admins
+        // with the users_view permission. Regular users cannot use this route.
+        if (!isAdmin(user) || !(await hasPermission(client, user, 'users_view'))) return json(403,{error:'Users permission required.'});
         const targetId = Number(event.queryStringParameters?.userId);
         if (!Number.isInteger(targetId)) return json(400,{error:'Valid userId is required.'});
         const w = await client.query(`SELECT w.balance,u.id,u.telegram_id,u.username,u.first_name,u.last_name FROM wallets w JOIN users u ON u.id=w.user_id WHERE u.id=$1`,[targetId]);
@@ -507,39 +515,25 @@ export async function handler(event) {
       if (![1,2].includes(gameType)) return json(400,{error:'gameType must be 1 or 2.'});
       await client.query('BEGIN');
       await client.query(`SELECT pg_advisory_xact_lock($1)`, [9100 + gameType]);
-      let r = await client.query(`SELECT id,game_type,stake,reward_rate,status,created_at,pick_started_at,started_at FROM games WHERE game_type=$1 AND status IN ('picking','running') ORDER BY created_at DESC LIMIT 1`,[gameType]);
+      let r = await client.query(`SELECT id,game_type,stake,reward_rate,status,created_at,pick_started_at FROM games WHERE game_type=$1 AND status IN ('picking','running') ORDER BY created_at DESC LIMIT 1`,[gameType]);
+      if (r.rows[0]?.status === 'picking') {
+        const elapsed = Math.floor((Date.now() - new Date(r.rows[0].pick_started_at).getTime()) / 1000);
+        if (elapsed >= PICK_WINDOW_SECONDS) {
+          const picked = await client.query(`SELECT COUNT(*)::int AS count FROM game_cards WHERE game_id=$1`, [r.rows[0].id]);
+          if (Number(picked.rows[0]?.count || 0) === 0) {
+            await client.query(`UPDATE games SET pick_started_at=NOW(), last_activity_at=NOW(), called_numbers='[]'::jsonb, call_index=0, current_call=NULL, next_call_at=NULL, winner_count=0, ended_reason=NULL, settled_at=NULL WHERE id=$1`, [r.rows[0].id]);
+            r = await client.query(`SELECT id,game_type,stake,reward_rate,status,created_at,pick_started_at,started_at,called_numbers,call_index,next_call_at,winner_count FROM games WHERE id=$1`, [r.rows[0].id]);
+          }
+        }
+      }
       if (!r.rows[0]) {
         const id = `R-${Date.now()}-${crypto.randomUUID().slice(0,8).toUpperCase()}`;
         const rr = await client.query(`SELECT value FROM app_settings WHERE key='reward_rate'`);
         const rate = Number(rr.rows[0]?.value ?? 85);
         r = await client.query(`INSERT INTO games(id,game_type,stake,reward_rate,status,pick_started_at,called_numbers,call_index) VALUES($1,$2,10,$3,'picking',NOW(),'[]'::jsonb,0) RETURNING id,game_type,stake,reward_rate,status,created_at,pick_started_at,started_at,called_numbers,call_index,next_call_at,winner_count`,[id,gameType,rate]);
       }
-
-      // The picking window is GLOBAL and server-authoritative. If a window
-      // expires with zero reservations, reset the SAME round's clock instead
-      // of launching a game or relying on any client's localStorage state.
-      // If at least one card exists, transition it to running immediately.
-      let round = r.rows[0];
-      const countR = await client.query(`SELECT COUNT(*)::int AS count FROM game_cards WHERE game_id=$1`, [round.id]);
-      let pickedCount = Number(countR.rows[0]?.count || 0);
-      if (round.status === 'picking') {
-        const elapsed = Math.floor((Date.now() - new Date(round.pick_started_at).getTime()) / 1000);
-        if (elapsed >= PICK_WINDOW_SECONDS) {
-          if (pickedCount > 0) {
-            const started = await client.query(`UPDATE games SET status='running',started_at=COALESCE(started_at,NOW()),next_call_at=COALESCE(next_call_at,NOW()),last_activity_at=NOW(),ended_reason=NULL WHERE id=$1 AND status='picking' RETURNING id,game_type,stake,reward_rate,status,created_at,pick_started_at,started_at`, [round.id]);
-            round = started.rows[0] || round;
-          } else {
-            const reset = await client.query(`UPDATE games SET pick_started_at=NOW(),started_at=NULL,next_call_at=NULL,called_numbers='[]'::jsonb,call_index=0,current_call=NULL,winner_count=0,last_activity_at=NOW(),ended_reason='no_cards_picked' WHERE id=$1 AND status='picking' RETURNING id,game_type,stake,reward_rate,status,created_at,pick_started_at,started_at`, [round.id]);
-            round = reset.rows[0] || round;
-          }
-        }
-      }
-      const serverNow = Date.now();
-      const secondsLeft = round.status === 'picking'
-        ? Math.max(0, PICK_WINDOW_SECONDS - Math.floor((serverNow - new Date(round.pick_started_at).getTime()) / 1000))
-        : 0;
       await client.query('COMMIT');
-      return json(200,{ok:true,round,pickedCount,serverNow,secondsLeft,pickWindowSeconds:PICK_WINDOW_SECONDS});
+      return json(200,{ok:true,round:r.rows[0]});
     }
 
     if (method === 'GET' && parts.at(-2) === 'games' && parts.at(-1) === 'state') {
@@ -559,7 +553,7 @@ export async function handler(event) {
         }
       }
       // Recovery-safe engine: one state request may advance every call whose
-      // scheduled 3-second deadline has already passed. This means the game
+      // scheduled 4-second deadline has already passed. This means the game
       // does not permanently pause when all clients briefly disconnect. The
       // DB row is locked above, so only one request can advance this round.
       let catchUp = 0;
@@ -630,8 +624,8 @@ export async function handler(event) {
     if (method === 'GET' && parts.at(-2) === 'games' && parts.at(-1) === 'cards') {
       const gameId = String(event.queryStringParameters?.gameId || '').trim();
       if (!gameId) return json(400,{error:'gameId is required.'});
-      const r = await client.query(`SELECT card_number,user_id,(user_id=$2) AS mine FROM game_cards WHERE game_id=$1 ORDER BY card_number`, [gameId, user.id]);
-      return json(200,{cards:r.rows,userId:Number(user.id)});
+      const r = await client.query(`SELECT card_number,user_id FROM game_cards WHERE game_id=$1 ORDER BY card_number`, [gameId]);
+      return json(200,{cards:r.rows});
     }
 
     if (method === 'POST' && parts.at(-2) === 'games' && parts.at(-1) === 'start') {
@@ -644,11 +638,7 @@ export async function handler(event) {
       const elapsed = Math.floor((Date.now() - new Date(r.rows[0].pick_started_at).getTime()) / 1000);
       if (elapsed < 35) { await client.query('ROLLBACK'); return json(409,{error:`Card picking is still open for ${PICK_WINDOW_SECONDS-elapsed} more seconds.`}); }
       const count = await client.query(`SELECT COUNT(*)::int count FROM game_cards WHERE game_id=$1`, [gameId]);
-      if (!count.rows[0].count) {
-        await client.query(`UPDATE games SET pick_started_at=NOW(),started_at=NULL,next_call_at=NULL,called_numbers='[]'::jsonb,call_index=0,current_call=NULL,winner_count=0,last_activity_at=NOW(),ended_reason='no_cards_picked' WHERE id=$1 AND status='picking'`, [gameId]);
-        await client.query('COMMIT');
-        return json(409,{error:'No cards were picked. A new 35-second card-picking window has started.',reset:true});
-      }
+      if (!count.rows[0].count) { await client.query('ROLLBACK'); return json(400,{error:'At least one card is required to start.'}); }
       await client.query(`UPDATE games SET status='running',started_at=COALESCE(started_at,NOW()),next_call_at=COALESCE(next_call_at,NOW()),last_activity_at=NOW(),ended_reason=NULL WHERE id=$1 AND status='picking'`, [gameId]);
       await client.query('COMMIT');
       return json(200,{ok:true,gameId,status:'running',cards:count.rows[0].count});
@@ -662,22 +652,6 @@ export async function handler(event) {
       const g = await client.query(`SELECT * FROM games WHERE id=$1 AND game_type=$2 FOR UPDATE`, [gameId,gameType]);
       if (!g.rows[0]) { await client.query('ROLLBACK'); return json(404,{error:'Game round not found.'}); }
       if (g.rows[0].status !== 'picking') { await client.query('ROLLBACK'); return json(409,{error:'Card picking is closed.'}); }
-
-      // Boundary-safe picker lifecycle: a reservation request arriving after
-      // the 35-second window must never write into an expired window. If no
-      // cards exist, start a fresh window first; if cards already exist, the
-      // round launches and this late reservation is rejected.
-      const elapsed = Math.floor((Date.now() - new Date(g.rows[0].pick_started_at).getTime()) / 1000);
-      if (elapsed >= PICK_WINDOW_SECONDS) {
-        const existing = await client.query(`SELECT COUNT(*)::int AS count FROM game_cards WHERE game_id=$1`, [gameId]);
-        if (Number(existing.rows[0]?.count || 0) > 0) {
-          await client.query(`UPDATE games SET status='running',started_at=COALESCE(started_at,NOW()),next_call_at=COALESCE(next_call_at,NOW()),last_activity_at=NOW(),ended_reason=NULL WHERE id=$1 AND status='picking'`, [gameId]);
-          await client.query('COMMIT');
-          return json(409,{error:'Game is starting now because the card-picking window has ended.',status:'running'});
-        }
-        await client.query(`UPDATE games SET pick_started_at=NOW(),started_at=NULL,next_call_at=NULL,called_numbers='[]'::jsonb,call_index=0,current_call=NULL,winner_count=0,last_activity_at=NOW(),ended_reason='no_cards_picked' WHERE id=$1 AND status='picking'`, [gameId]);
-      }
-
       const referenceId = `stake-${gameId}-${cardNumber}`;
       // Idempotency: a client retry after a successful commit must not charge
       // the player a second time. The game row is already locked above.

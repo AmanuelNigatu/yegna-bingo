@@ -15,6 +15,11 @@ const PICKER_NAV_ITEMS = [
 const TOTAL_CARDS = 600;
 const MAX_PICKED = 2;
 
+function assetUrl(path) {
+  const base = import.meta.env.BASE_URL || "/";
+  return `${base}${String(path).replace(/^\//, "")}`;
+}
+
 function seededRandom(seed) {
   let x = seed >>> 0;
   return () => {
@@ -248,7 +253,7 @@ function App() {
       <div className="app-shell framed-page">
         <div className="page-frame" aria-hidden="true" />
         <div className="wallet-page profile-page">
-          <img className="small-logo" src="/assets/yegna-logo.png" alt="YEGNA BINGO" />
+          <img className="small-logo" src={assetUrl("assets/yegna-logo.png")} alt="YEGNA BINGO" />
           <div className="wallet-panel"><UserRound size={28}/><h1>Profile</h1><p>{getPlayerDisplayName()}</p><button className="wallet-action" onClick={() => navigate("/admin/wallet")}>Admin Wallet</button></div>
         </div>
         <BottomNav items={navItems} activeKey="profile" onNavigate={navigate} />
@@ -267,7 +272,7 @@ function App() {
       <main className="home">
         <section className="hero">
           <div className="hero-topline"><Crown size={20} fill="currentColor" /> <span>PREMIUM BINGO</span> <Crown size={20} fill="currentColor" /></div>
-          <img className="logo" src="/assets/yegna-logo.png" alt="YEGNA BINGO logo" />
+          <img className="logo" src={assetUrl("assets/yegna-logo.png")} alt="YEGNA BINGO logo" />
           <div className="welcome"><span>Welcome to</span><strong>YEGNA BINGO</strong></div>
           <div className="tagline"><span>PLAY</span><i /> <span>MARK</span><i /> <span>WIN</span></div>
           <div className="hero-sheen" />
@@ -308,15 +313,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
   const [notice, setNotice] = useState("");
   const [busyCard, setBusyCard] = useState(null);
   const [serverTakenCards, setServerTakenCards] = useState(new Set());
-  const [serverPickedCount, setServerPickedCount] = useState(0);
   const [serverRoundReady, setServerRoundReady] = useState(!isBackendConfigured());
-  const [serverNow, setServerNow] = useState(Date.now());
-  const [serverSecondsLeft, setServerSecondsLeft] = useState(null);
-  const serverSecondsRef = useRef(null);
-  const serverNowRef = useRef(Date.now());
-  const serverSecondsSyncAtRef = useRef(Date.now());
-  const onWatchRef = useRef(onWatch);
-  useEffect(() => { onWatchRef.current = onWatch; }, [onWatch]);
   const [round, setRound] = useState(() => {
     return getOrCreateRound(gameId);
   });
@@ -335,21 +332,13 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
           pickStartedAt: new Date(r.pick_started_at || r.created_at).getTime(),
           completedAt: r.settled_at ? new Date(r.settled_at).getTime() : null
         };
-        setServerPickedCount(Number(result.pickedCount || 0));
-        const nextSeconds = Number.isFinite(Number(result.secondsLeft)) ? Number(result.secondsLeft) : null;
-        const nextServerNow = Number.isFinite(Number(result.serverNow)) ? Number(result.serverNow) : (Date.parse(result.serverNow || "") || Date.now());
-        serverSecondsRef.current = nextSeconds;
-        serverNowRef.current = nextServerNow;
-        serverSecondsSyncAtRef.current = Date.now();
-        setServerSecondsLeft(nextSeconds);
-        setServerNow(nextServerNow);
         setServerRoundReady(true);
         setRound(prev => {
           if (prev.id === next.id && prev.status === next.status && prev.pickStartedAt === next.pickStartedAt) return prev;
           return next;
         });
         writeRound(gameId, next);
-        if (next.status === "live") onWatchRef.current?.();
+        if (next.status === "live") onWatch();
       } catch (e) {
         if (alive) {
           setServerRoundReady(false);
@@ -360,7 +349,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     sync();
     const timer = setInterval(sync, 1000);
     return () => { alive = false; clearInterval(timer); };
-  }, [gameId]);
+  }, [gameId, onWatch]);
 
   const [secondsLeft, setSecondsLeft] = useState(() => {
     const saved = readRound(gameId);
@@ -371,16 +360,13 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
   const myCards = session.picked?.[gameId] || [];
   const playerKey = getPlayerKey();
   const selectedRoom = session.roomId && session.roomId !== gameId ? session.roomId : null;
-  const [myServerCards, setMyServerCards] = useState(new Set());
-  const effectiveMyCards = isBackendConfigured() ? Array.from(myServerCards) : myCards;
-  const effectiveMySet = useMemo(() => new Set(effectiveMyCards.map(Number)), [effectiveMyCards.join(',')]);
   const occupiedByOthers = useMemo(() => {
-    const taken = new Set(serverTakenCards);
-    effectiveMySet.forEach(n => taken.delete(Number(n)));
-    if (isBackendConfigured()) return taken;
     const registry = readPickedRegistryForRound(gameId, roundId);
-    return new Set(Object.entries(registry).filter(([, owner]) => owner !== playerKey).map(([n]) => Number(n)));
-  }, [gameId, roundId, playerKey, effectiveMyCards.join(','), serverTakenCards]);
+    const localTaken = new Set(Object.entries(registry).filter(([, owner]) => owner !== playerKey).map(([n]) => Number(n)));
+    serverTakenCards.forEach(n => localTaken.add(Number(n)));
+    myCards.forEach(n => localTaken.delete(Number(n)));
+    return localTaken;
+  }, [gameId, roundId, playerKey, myCards.length, serverTakenCards]);
 
   const visibleCards = useMemo(() => {
     const q = query.trim();
@@ -390,38 +376,57 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     return cards.filter(c => c.number === n);
   }, [cards, query]);
 
-  // GLOBAL picker clock: keep ONE stable interval. The previous implementation
-  // depended on onWatch/server countdown state, which are recreated on renders;
-  // that repeatedly reset the local clock and could leave the UI stuck at 35s.
-  // The server remains authoritative; refs let the display tick smoothly between
-  // 1-second server synchronizations without restarting the timer.
+  // The 35-second picker window is tied to the current round. When it expires,
+  // the game starts if at least one card has been reserved by any user.
+  // If nobody picked a card, create a fresh picking round and restart the
+  // countdown from 35 seconds on the Card Pick page.
   useEffect(() => {
     if (isBackendConfigured() && !serverRoundReady) return;
+    if (round.status === "live") {
+      onWatch();
+      return;
+    }
     if (round.status === "complete") return;
-    if (round.status === "live") { onWatchRef.current?.(); return; }
-
-    const localAtSync = Date.now();
-    const serverAtSync = Number.isFinite(Number(serverNowRef.current)) && Number(serverNowRef.current) > 0
-      ? Number(serverNowRef.current)
-      : localAtSync;
-    const startedAt = Number(round.pickStartedAt || serverAtSync);
 
     const tick = () => {
-      const latestServerSeconds = Number(serverSecondsRef.current);
-      if (Number.isFinite(latestServerSeconds)) {
-        // Use the timestamp of the most recent server countdown sample, not
-        // the timestamp when this React effect was created.
-        const elapsedSinceServerSync = Math.floor((Date.now() - serverSecondsSyncAtRef.current) / 1000);
-        setSecondsLeft(Math.max(0, latestServerSeconds - elapsedSinceServerSync));
-        return;
+      const latest = readRound(gameId) || round;
+      const remaining = Math.max(0, 35 - Math.floor((Date.now() - latest.pickStartedAt) / 1000));
+      setSecondsLeft(remaining);
+      if (remaining <= 0) {
+        // A player may start with just ONE card. The round is global, so the
+        // decision is based on whether ANY user reserved at least one card.
+        const registry = readPickedRegistryForRound(gameId, latest.id);
+        const anyCardsPicked = Object.keys(registry).length > 0;
+
+        if (anyCardsPicked) {
+          const launch = async () => {
+            try {
+              if (isBackendConfigured()) await walletApi.startGame(latest.id);
+              const live = { ...latest, status: "live" };
+              writeRound(gameId, live);
+              setRound(live);
+              onWatch();
+            } catch (e) {
+              setNotice(e.message || "Game could not start. Please try again.");
+            }
+          };
+          launch();
+        } else {
+          // Nobody picked anything: do not enter the Game page. Start a brand
+          // new 35-second picking window instead.
+          const fresh = createRound(gameId);
+          writeRound(gameId, fresh);
+          setRound(fresh);
+          setSecondsLeft(35);
+        }
+      } else if (latest.id !== round.id || latest.status !== round.status) {
+        setRound(latest);
       }
-      const authoritativeNow = serverAtSync + (Date.now() - localAtSync);
-      setSecondsLeft(Math.max(0, 35 - Math.floor((authoritativeNow - startedAt) / 1000)));
     };
     tick();
     const timer = setInterval(tick, 250);
     return () => clearInterval(timer);
-  }, [round.status, round.pickStartedAt, serverRoundReady]);
+  }, [gameId, round.id, round.status, round.pickStartedAt, myCards.length, onWatch, serverRoundReady]);
 
   useEffect(() => {
     if (isBackendConfigured()) return;
@@ -441,10 +446,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     const load = async () => {
       try {
         const result = await walletApi.getGameCards(roundId);
-        if (alive) {
-          setServerTakenCards(new Set((result.cards || []).map(c => Number(c.card_number))));
-          setServerPickedCount((result.cards || []).length);
-        }
+        if (alive) setServerTakenCards(new Set((result.cards || []).map(c => Number(c.card_number))));
       } catch {}
     };
     load();
@@ -452,32 +454,16 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     return () => { alive = false; clearInterval(timer); };
   }, [roundId]);
 
-  // Backend is authoritative in production. Do not clear valid server picks
-  // because the old localStorage registry is empty/stale (this used to make
-  // a successful pick disappear immediately).
+  // Cards belong to the round, never to the next game. If this is a fresh
+  // round and the saved session still contains cards from the previous one,
+  // clear them before the user can continue.
   useEffect(() => {
-    if (!isBackendConfigured()) return;
-    let alive = true;
-    const syncMine = async () => {
-      try {
-        const result = await walletApi.getGameCards(roundId);
-        if (!alive) return;
-        const mine = (result.cards || [])
-          .filter(c => c.mine === true || Number(c.user_id) === Number(result.userId))
-          .map(c => Number(c.card_number))
-          .filter(n => Number.isInteger(n) && n >= 1 && n <= TOTAL_CARDS)
-          .slice(0, MAX_PICKED);
-        setMyServerCards(new Set(mine));
-        setSession(s => ({
-          ...s,
-          roomId: mine.length ? gameId : (s.roomId === gameId ? null : s.roomId),
-          picked: { ...(s.picked || {}), [gameId]: mine }
-        }));
-      } catch {}
-    };
-    syncMine();
-    const timer = setInterval(syncMine, 1200);
-    return () => { alive = false; clearInterval(timer); };
+    if (!myCards.length) return;
+    const registry = readPickedRegistryForRound(gameId, roundId);
+    const hasMineInThisRound = Object.values(registry).some(owner => owner === playerKey);
+    if (!hasMineInThisRound) {
+      setSession(s => ({ ...s, roomId: null, picked: { ...(s.picked || {}), [gameId]: [] } }));
+    }
   }, [gameId, roundId]);
 
   async function pickCard(cardNumber) {
@@ -487,11 +473,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
       setNotice(`You already joined ${GAMES.find(g => g.id === session.roomId)?.label}. Finish that game before joining another.`);
       return;
     }
-    if (isBackendConfigured() && !serverRoundReady) {
-      setNotice("Connecting to the secure game server…");
-      return;
-    }
-    const latestRound = isBackendConfigured() ? round : (readRound(gameId) || round);
+    const latestRound = readRound(gameId) || round;
     if (latestRound.status !== "picking") {
       onWatch();
       return;
@@ -500,19 +482,18 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
       setNotice(`Card #${cardNumber} is already held by another user.`);
       return;
     }
-    const selected = effectiveMySet.has(cardNumber);
+    const selected = myCards.includes(cardNumber);
     if (selected) {
       setBusyCard(cardNumber);
       try {
         if (isBackendConfigured()) {
           await walletApi.releaseCard(roundId, cardNumber);
         }
-        const next = effectiveMyCards.filter(n => Number(n) !== cardNumber);
+        const next = myCards.filter(n => n !== cardNumber);
         const registry = readPickedRegistryForRound(gameId, roundId);
         if (registry[String(cardNumber)] === playerKey) delete registry[String(cardNumber)];
         writePickedRegistryForRound(gameId, roundId, registry);
         setServerTakenCards(prev => { const n = new Set(prev); n.delete(cardNumber); return n; });
-        setMyServerCards(prev => { const n = new Set(prev); n.delete(cardNumber); return n; });
         setSession(s => ({ ...s, roomId: next.length ? gameId : null, picked: { ...(s.picked || {}), [gameId]: next } }));
         setNotice(`Card #${cardNumber} released. 10 ETB stake refunded.`);
       } catch (e) {
@@ -522,7 +503,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
       }
       return;
     }
-    if (effectiveMyCards.length >= MAX_PICKED) {
+    if (myCards.length >= MAX_PICKED) {
       setNotice("Maximum 2 Bingo cards. Release one card before choosing another.");
       return;
     }
@@ -533,22 +514,21 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
       if (isBackendConfigured()) {
         await walletApi.reserveStake(roundId, cardNumber, game.amount, gameId);
       }
-      // The API call is the reservation. Never require a local registry to
-      // confirm success; that registry is only a legacy offline fallback.
-      savePlayerDisplayName(playerKey, getPlayerDisplayName());
-      setServerTakenCards(prev => new Set([...prev, cardNumber]));
-      setMyServerCards(prev => new Set([...prev, cardNumber]));
-      setSession(s => ({
-        ...s,
-        roomId: gameId,
-        picked: { ...(s.picked || {}), [gameId]: Array.from(new Set([...(s.picked?.[gameId] || []), cardNumber])).slice(0, MAX_PICKED) }
-      }));
-      if (!isBackendConfigured()) {
-        const registry = readPickedRegistryForRound(gameId, roundId);
+      const registry = readPickedRegistryForRound(gameId, roundId);
+      if (!registry[String(cardNumber)]) {
         registry[String(cardNumber)] = playerKey;
+        savePlayerDisplayName(playerKey, getPlayerDisplayName());
         writePickedRegistryForRound(gameId, roundId, registry);
+        setServerTakenCards(prev => new Set([...prev, cardNumber]));
+        setSession(s => ({ ...s, roomId: gameId, picked: { ...(s.picked || {}), [gameId]: [...(s.picked?.[gameId] || []), cardNumber] } }));
+        setNotice(`Card #${cardNumber} reserved. ${game.amount} ETB stake deducted.`);
+      } else {
+        // A concurrent local-tab race should never silently keep a server stake.
+        if (isBackendConfigured()) {
+          try { await walletApi.releaseCard(roundId, cardNumber); } catch {}
+        }
+        setNotice(`Card #${cardNumber} is already picked.`);
       }
-      setNotice(`Card #${cardNumber} reserved. ${game.amount} ETB stake deducted.`);
     } catch (e) {
       setNotice(e.message || "Card selection failed.");
     } finally {
@@ -560,25 +540,20 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     setNotice("");
     if (isBackendConfigured()) {
       try {
-        for (const cardNumber of effectiveMyCards) await walletApi.releaseCard(roundId, cardNumber);
+        for (const cardNumber of myCards) await walletApi.releaseCard(roundId, cardNumber);
       } catch (e) {
         setNotice(e.message || "One or more cards could not be released.");
         return;
       }
     }
     const registry = readPickedRegistryForRound(gameId, roundId);
-    for (const cardNumber of effectiveMyCards) {
+    for (const cardNumber of myCards) {
       if (registry[String(cardNumber)] === playerKey) delete registry[String(cardNumber)];
     }
     writePickedRegistryForRound(gameId, roundId, registry);
-    setServerTakenCards(prev => {
-      const next = new Set(prev);
-      effectiveMyCards.forEach(n => next.delete(Number(n)));
-      return next;
-    });
-    setMyServerCards(new Set());
+    setServerTakenCards(new Set());
     setSession(s => ({ ...s, roomId: null, picked: { ...(s.picked || {}), [gameId]: [] } }));
-    setNotice(`Your selected cards were released and ${effectiveMyCards.length * game.amount} ETB refunded.`);
+    setNotice(`Your selected cards were released and ${myCards.length * game.amount} ETB refunded.`);
   }
 
   return (
@@ -586,14 +561,14 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
       <div className="page-frame" aria-hidden="true" />
       <header className="picker-header">
         <button className="header-back" onClick={onBack}><ArrowLeft size={21} /></button>
-        <div><img src="/assets/yegna-logo.png" alt="YEGNA BINGO" /><span>{game.label} · BINGO</span></div>
+        <div><img src={assetUrl("assets/yegna-logo.png")} alt="YEGNA BINGO" /><span>{game.label} · BINGO</span></div>
         <div className="header-crown"><Crown size={24} fill="currentColor" /></div>
       </header>
 
       <main className="picker-main">
         <section className={`picker-hero ${game.tone}`}>
           <div><span className="picker-kicker">BINGO CARD PICK</span><h1>{game.label}</h1><p>600 cards available · choose up to 2</p></div>
-          <div className="picked-counter"><strong>{secondsLeft}s</strong><span>PICKING TIME</span><small>{effectiveMyCards.length}/2 CARDS</small></div>
+          <div className="picked-counter"><strong>{secondsLeft}s</strong><span>PICKING TIME</span><small>{myCards.length}/2 CARDS</small></div>
         </section>
 
         {selectedRoom && <div className="room-warning"><LockKeyhole size={17} /> You are already playing another Bingo game.</div>}
@@ -601,22 +576,22 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
 
         <section className="picker-controls">
           <div className="search-box"><span>#</span><input inputMode="numeric" value={query} onChange={e => setQuery(e.target.value.replace(/[^0-9]/g, ""))} placeholder="Find card number 1–600" /></div>
-          <button className="release-btn" onClick={resetMyCards} disabled={!effectiveMyCards.length}><RotateCcw size={16} /> Release</button>
+          <button className="release-btn" onClick={resetMyCards} disabled={!myCards.length}><RotateCcw size={16} /> Release</button>
         </section>
 
         <button className="watch-game-btn" onClick={() => {
-          if (round.status === "picking" && effectiveMyCards.length < 1) {
+          if (round.status === "picking" && myCards.length < 1) {
             setNotice("Please pick at least 1 Bingo card before starting the game.");
             return;
           }
           onWatch();
-        }} disabled={round.status === "picking" && (secondsLeft > 0 || effectiveMyCards.length < 1)}><Radio size={17} /> {round.status === "picking" ? (effectiveMyCards.length < 1 ? "PICK 1 CARD TO START" : `GAME STARTS IN ${secondsLeft}s`) : "CONTINUE TO GAME"}<span>›</span></button>
+        }} disabled={round.status === "picking" && (secondsLeft > 0 || myCards.length < 1)}><Radio size={17} /> {round.status === "picking" ? (myCards.length < 1 ? "PICK 1 CARD TO START" : `GAME STARTS IN ${secondsLeft}s`) : "CONTINUE TO GAME"}<span>›</span></button>
 
         <div className="legend"><span><i className="legend-free" /> Available</span><span><i className="legend-mine" /> Yours</span><span><LockKeyhole size={14} /> Taken</span></div>
 
         <section className="card-grid">
           {visibleCards.map(card => {
-            const mine = effectiveMySet.has(card.number);
+            const mine = myCards.includes(card.number);
             const locked = occupiedByOthers.has(card.number);
             return <BingoCard key={card.number} card={card} mine={mine} locked={locked} busy={busyCard === card.number} onClick={() => pickCard(card.number)} />;
           })}
@@ -670,7 +645,7 @@ function callerAudioName(n) {
   return `${prefix}${n}.mp3`;
 }
 function callerAudioUrl(name) {
-  return `/assets/audio/${name}`;
+  return assetUrl(`assets/audio/${name}`);
 }
 
 
@@ -1114,7 +1089,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
       ? `YOUR ${myCards.length} CARD${myCards.length > 1 ? "S" : ""} · FOLLOW THE CALLS`
       : "SPECTATOR MODE · FOLLOW THE CALLS";
 
-  // Calling numbers are independent from Auto. As soon as the 35-second
+  // Calling numbers are independent from Auto. Calls run every 4 seconds after the 35-second
   // picker ends and the round becomes live, calls begin automatically.
   useEffect(() => {
     if (isBackendConfigured()) return;
@@ -1130,7 +1105,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
       });
     };
     makeCall();
-    const timer = setInterval(makeCall, 3000);
+    const timer = setInterval(makeCall, 4000);
     return () => clearInterval(timer);
   }, [gameComplete, winnerKey, roundStatus]);
 
@@ -1180,7 +1155,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
       <div className="page-frame" aria-hidden="true" />
       <header className="bingo-header">
         <button className="header-back" onClick={onBack}><ArrowLeft size={21} /></button>
-        <div className="bingo-header-brand"><img src="/assets/yegna-logo.png" alt="YEGNA BINGO" /><span>{game.label} · LIVE BINGO</span></div>
+        <div className="bingo-header-brand"><img src={assetUrl("assets/yegna-logo.png")} alt="YEGNA BINGO" /><span>{game.label} · LIVE BINGO</span></div>
         <div className="header-crown"><Crown size={24} fill="currentColor" /></div>
       </header>
 
@@ -1286,7 +1261,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
           {isWinner && <PrizeCelebration />}
           <section className={`winner-modal ${isWinner ? "winner-modal-self" : "winner-modal-other"}`}>
             <div className="winner-modal-inner">
-              <img className="winner-modal-logo" src="/assets/yegna-logo.png" alt="YEGNA BINGO" />
+              <img className="winner-modal-logo" src={assetUrl("assets/yegna-logo.png")} alt="YEGNA BINGO" />
               <h1>BINGO!</h1>
               {isWinner ? (
                 <>
@@ -1367,7 +1342,7 @@ function WalletPage({ onNavigate }) {
   useEffect(() => { load(); }, [load]);
 
   return <div className="app-shell framed-page wallet-page-shell"><div className="page-frame" aria-hidden="true"/>
-    <header className="simple-page-header"><button className="header-back" onClick={()=>onNavigate("/")}><ArrowLeft size={21}/></button><div><img src="/assets/yegna-logo.png"/><span>MY WALLET</span></div><WalletCards size={24}/></header>
+    <header className="simple-page-header"><button className="header-back" onClick={()=>onNavigate("/")}><ArrowLeft size={21}/></button><div><img src={assetUrl("assets/yegna-logo.png")}/><span>MY WALLET</span></div><WalletCards size={24}/></header>
     <main className="wallet-main">
       <section className="wallet-hero"><span>AVAILABLE BALANCE</span><div><WalletCards size={25}/><strong>{show ? `${Number(wallet.balance||0).toFixed(2)} ETB` : "••••••"}</strong><button onClick={()=>setShow(v=>!v)}>{show?<EyeOff size={19}/>:<Eye size={19}/>}</button></div></section>
       {loading && <div className="empty-wallet"><RefreshCw size={25}/><p>Loading wallet…</p></div>}
@@ -1428,7 +1403,7 @@ function AdminWalletPage({ onNavigate }) {
   const removeSubAdmin=async(id)=>{ if(!confirm("Remove this sub admin and return the account to normal user access?"))return; setSubAdminBusy(true);setSubAdminMessage(""); try { await walletApi.removeSubAdmin(id); setSubAdmins((await walletApi.getSubAdmins()).subAdmins||[]); setSubAdminMessage("Sub admin removed."); } catch(e){setSubAdminMessage(e.message);} finally{setSubAdminBusy(false);} };
   const togglePermission=async(admin,key)=>{ const next={...(admin.permissions||{}),[key]:!(admin.permissions||{})[key]}; setSubAdminBusy(true);setSubAdminMessage(""); try { await walletApi.updateSubAdminPermissions(admin.id,next); setSubAdmins(list=>list.map(x=>x.id===admin.id?{...x,permissions:next}:x)); } catch(e){setSubAdminMessage(e.message);} finally{setSubAdminBusy(false);} };
   const permissionLabels={dashboard_view:"Dashboard",users_view:"Users",wallet_manage:"Wallet",reward_manage:"Reward",game_manage:"Game"};
-  return <div className="app-shell framed-page wallet-page-shell"><div className="page-frame" aria-hidden="true"/><header className="simple-page-header"><button className="header-back" onClick={()=>onNavigate("/")}><ArrowLeft size={21}/></button><div><img src="/assets/yegna-logo.png"/><span>ADMIN · WALLET MANAGEMENT</span></div><Crown size={24}/></header><main className="wallet-main admin-main">
+  return <div className="app-shell framed-page wallet-page-shell"><div className="page-frame" aria-hidden="true"/><header className="simple-page-header"><button className="header-back" onClick={()=>onNavigate("/")}><ArrowLeft size={21}/></button><div><img src={assetUrl("assets/yegna-logo.png")}/><span>ADMIN · WALLET MANAGEMENT</span></div><Crown size={24}/></header><main className="wallet-main admin-main">
     <section className="admin-stats"><div><b>{serverStats?.users ?? allUsers.length}</b><span>Total Users</span></div><div><b>{totalBalance.toFixed(2)}</b><span>Total Balance</span></div><div><b>{totalDeposits.toFixed(2)}</b><span>Total Deposits</span></div><div><b>{totalWithdrawals.toFixed(2)}</b><span>Total Withdrawals</span></div><div><b>{totalStakes.toFixed(2)}</b><span>Total Stakes</span></div><div><b>{totalRewards.toFixed(2)}</b><span>Rewards Paid</span></div></section>
     <section className="admin-card wallet-requests-card"><div className="panel-title"><RefreshCw size={19}/><h2>Deposit / Withdraw Approval</h2></div><p>Review wallet requests submitted through the Telegram Bot. Balance changes happen only after approval.</p><div className="request-tabs"><button className={requestFilter==="pending"?"active":""} onClick={()=>setRequestFilter("pending")}>Pending</button><button className={requestFilter==="approved"?"active":""} onClick={()=>setRequestFilter("approved")}>Approved</button><button className={requestFilter==="rejected"?"active":""} onClick={()=>setRequestFilter("rejected")}>Rejected</button><button className="request-refresh" onClick={loadWalletRequests} disabled={requestBusy}><RefreshCw size={15}/></button></div>{requestMessage&&<small className="subadmin-message">{requestMessage}</small>}<div className="wallet-request-list">{walletRequests.map(r=><div className={`wallet-request-row ${r.status}`} key={r.id}><div className="wallet-request-head"><span><b>{r.type==='deposit'?'DEPOSIT':'WITHDRAW'}</b><small>@{r.username||'YEGNA User'} · Telegram ID: {r.telegram_id}</small></span><strong>{Number(r.amount).toFixed(2)} ETB</strong></div><div className="wallet-request-meta"><span>#{r.id} · {new Date(r.requested_at).toLocaleString()}</span><span>{r.method||'Telegram Bot'}</span></div>{r.detail&&<div className="wallet-request-detail">{r.detail}</div>}{r.status==='pending'&&<div className="request-actions"><button onClick={()=>approveRequest(r.id)} disabled={requestBusy}>Approve</button><button className="danger" onClick={()=>rejectRequest(r.id)} disabled={requestBusy}>Reject</button></div>}{r.status!=='pending'&&<div className="request-status">{r.status.toUpperCase()}{r.rejection_reason?` · ${r.rejection_reason}`:''}</div>}</div>)}{!walletRequests.length&&<div className="empty-wallet"><RefreshCw size={27}/><p>No {requestFilter} wallet requests.</p></div>}</div></section>
     <section className="admin-card"><div className="panel-title"><Sparkles size={19}/><h2>Reward Control</h2></div><p>Admin controls the reward percentage used for new games.</p><div className="reward-control"><input type="number" min="0" max="100" value={rate} onChange={e=>setRate(e.target.value)}/><b>%</b><button onClick={saveRate}>Save</button></div><small className="demo-note">Reward is applied when the game is settled. Production wallet control must be enforced by the backend.</small></section>
@@ -1494,7 +1469,7 @@ function BingoCard({ card, mine, locked, busy, onClick }) {
       <div className="bingo-grid">
         {card.grid.flatMap((row, r) => row.map((value, c) => <span key={`${r}-${c}`} className={value === "FREE" ? "free" : ""}>{value === "FREE" ? "★" : value}</span>))}
       </div>
-      
+      <div className="card-status">{locked ? "TAKEN" : mine ? "YOUR CARD" : "TAP TO PICK"}</div>
     </button>
   );
 }

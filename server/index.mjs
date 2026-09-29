@@ -5,81 +5,93 @@ import { handler as botHandler } from './bot.mjs';
 const PORT = Number(process.env.PORT || 3000);
 const HOST = process.env.HOST || '0.0.0.0';
 
-function readBody(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.setEncoding('utf8');
-    req.on('data', chunk => {
-      body += chunk;
-      if (body.length > 2_000_000) {
-        reject(new Error('Request body too large'));
-        req.destroy();
-      }
-    });
-    req.on('end', () => resolve(body));
-    req.on('error', reject);
-  });
-}
-
-function headersObject(req) {
+function headersToObject(headers) {
   const out = {};
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (Array.isArray(value)) out[key] = value.join(', ');
-    else if (value != null) out[key] = value;
-  }
+  for (const [key, value] of Object.entries(headers || {})) out[key] = value;
   return out;
 }
 
-function toEvent(req, body) {
+function eventFromRequest(req, body) {
   const url = new URL(req.url || '/', `http://${req.headers.host || 'localhost'}`);
+  const queryStringParameters = Object.fromEntries(url.searchParams.entries());
   return {
-    httpMethod: req.method,
+    httpMethod: req.method || 'GET',
     path: url.pathname,
-    rawQuery: url.search.slice(1),
-    headers: headersObject(req),
-    body
+    rawUrl: req.url,
+    headers: req.headers,
+    queryStringParameters,
+    body,
+    isBase64Encoded: false,
   };
 }
 
-function send(res, result) {
-  const status = Number(result?.statusCode || 200);
-  for (const [key, value] of Object.entries(result?.headers || {})) {
-    if (value != null) res.setHeader(key, value);
+const MAX_BODY_BYTES = 1024 * 1024;
+
+async function readBody(req) {
+  if (req.method === 'GET' || req.method === 'HEAD' || req.method === 'OPTIONS') return '';
+  const declaredLength = Number(req.headers['content-length'] || 0);
+  if (declaredLength > MAX_BODY_BYTES) {
+    req.resume();
+    const error = new Error('Request body too large');
+    error.statusCode = 413;
+    throw error;
   }
-  res.statusCode = status;
-  res.end(result?.body ?? '');
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let total = 0;
+    let tooLarge = false;
+    const onEnd = () => {
+      if (!tooLarge) resolve(Buffer.concat(chunks).toString('utf8'));
+    };
+    req.on('data', chunk => {
+      if (tooLarge) return;
+      total += chunk.length;
+      if (total > MAX_BODY_BYTES) {
+        tooLarge = true;
+        req.removeListener('end', onEnd);
+        req.resume();
+        const error = new Error('Request body too large');
+        error.statusCode = 413;
+        reject(error);
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.once('end', onEnd);
+    req.once('error', reject);
+  });
 }
 
 const server = http.createServer(async (req, res) => {
   try {
-    const body = req.method === 'GET' || req.method === 'HEAD' ? '' : await readBody(req);
-    const event = toEvent(req, body);
+    const body = await readBody(req);
+    const event = eventFromRequest(req, body);
+    let result;
 
-    if (event.path === '/api/bot' || event.path.startsWith('/api/bot/')) {
-      send(res, await botHandler(event));
-      return;
+    if (event.path === '/telegram/webhook' || event.path === '/telegram/webhook/') {
+      result = await botHandler(event);
+    } else if (event.path === '/api' || event.path.startsWith('/api/')) {
+      result = await apiHandler(event);
+    } else if (event.path === '/health' || event.path === '/health/') {
+      result = { statusCode: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ok: true, service: 'yegna-bingo' }) };
+    } else {
+      result = { statusCode: 404, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ error: 'Not found' }) };
     }
-    if (event.path === '/api' || event.path.startsWith('/api/')) {
-      send(res, await apiHandler(event));
-      return;
-    }
-    if (event.path === '/health' || event.path === '/') {
-      res.setHeader('Content-Type', 'application/json');
-      res.statusCode = 200;
-      res.end(JSON.stringify({ ok: true, service: 'yegna-bingo-backend' }));
-      return;
-    }
-    res.statusCode = 404;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ error: 'Not found.' }));
+
+    res.writeHead(result.statusCode || 200, headersToObject(result.headers));
+    res.end(result.body || '');
   } catch (error) {
-    console.error(JSON.stringify({ service: 'yegna-bingo-backend', event: 'server_error', error: error?.message || 'unknown error' }));
-    if (!res.headersSent) {
-      res.statusCode = 500;
-      res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({ error: 'Internal server error.' }));
+    if (error?.statusCode === 413) {
+      if (!res.headersSent) res.writeHead(413, { 'Content-Type': 'application/json', 'Connection': 'close' });
+      if (!res.destroyed) res.end(JSON.stringify({ error: 'Request body exceeds the 1 MiB limit.' }));
+      return;
     }
+    console.error('HTTP server error', error);
+    if (!res.headersSent) res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Internal server error.' }));
   }
 });
 
-server.listen(PORT, HOST, () => console.log(`YEGNA BINGO backend listening on ${HOST}:${PORT}`));
+server.listen(PORT, HOST, () => {
+  console.log(`YEGNA BINGO server listening on ${HOST}:${PORT}`);
+});
