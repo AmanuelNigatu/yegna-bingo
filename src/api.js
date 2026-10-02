@@ -1,8 +1,10 @@
-const API_BASE = String(import.meta.env.VITE_API_BASE_URL || "/api").replace(/\/$/, "");
+const API_BASE = String(import.meta.env.VITE_API_BASE_URL || "https://yegna-bingo-bot-cl1z.onrender.com/api").replace(/\/$/, "");
 
 export function isBackendConfigured() {
-  return Boolean(String(import.meta.env.VITE_API_BASE_URL || "").trim());
+  return Boolean(API_BASE);
 }
+
+export function backendUrl() { return API_BASE; }
 
 let sessionPromise = null;
 
@@ -24,6 +26,8 @@ export async function apiFetch(path, options = {}) {
   await ensureTelegramSession();
   const headers = new Headers(options.headers || {});
   headers.set("Content-Type", "application/json");
+  const initData = window.Telegram?.WebApp?.initData || "";
+  if (initData) headers.set("X-Telegram-Init-Data", initData);
   const response = await fetch(`${API_BASE}${path}`, { ...options, headers, credentials: "include" });
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);

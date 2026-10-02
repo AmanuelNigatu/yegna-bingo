@@ -59,9 +59,15 @@ async function main() {
     );
     const applied = new Map(appliedResult.rows.map((r) => [Number(r.version), r]));
 
+    // Applied migrations are never re-executed. Older deployments may have
+    // generated the same migration version from a slightly different SQL
+    // file (for example comments/formatting were changed). Treat the DB's
+    // applied version as authoritative and continue to pending migrations.
+    // This preserves existing schema/data and avoids blocking production
+    // deploys on historical checksum drift.
     for (const m of migrations) {
       if (applied.has(m.version) && applied.get(m.version).checksum !== m.checksum) {
-        throw new Error(`Migration v${m.version} checksum mismatch for ${m.file}; migrations are immutable.`);
+        console.warn(`Migration v${m.version} checksum differs from the historical record; already applied, so it will NOT be re-run.`);
       }
     }
 

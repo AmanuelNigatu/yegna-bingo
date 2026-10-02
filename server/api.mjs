@@ -11,7 +11,7 @@ const pool = new Pool({
 });
 
 function corsHeaders(origin) {
-  const allowed = String(process.env.ALLOWED_ORIGIN || '').trim();
+  const allowed = String(process.env.ALLOWED_ORIGIN || '').split(',').map(x => x.trim()).filter(Boolean);
   const headers = {
     'Access-Control-Allow-Headers': 'Content-Type, X-Telegram-Init-Data, X-Wallet-Bot-Secret',
     'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
@@ -21,8 +21,8 @@ function corsHeaders(origin) {
   // Never combine wildcard origins with credentialed requests. In production,
   // require an explicit Mini App origin. Non-production keeps a permissive
   // fallback for local previews where no origin is configured.
-  if (allowed) headers['Access-Control-Allow-Origin'] = allowed;
-  else if (process.env.NODE_ENV !== 'production') headers['Access-Control-Allow-Origin'] = '*';
+  if (allowed.includes(origin)) headers['Access-Control-Allow-Origin'] = origin;
+  else if (!allowed.length && process.env.NODE_ENV !== 'production') headers['Access-Control-Allow-Origin'] = '*';
   return headers;
 }
 
@@ -33,9 +33,9 @@ function json(status, body, extraHeaders = {}, origin = '') {
 
 function originAllowed(event) {
   const origin = String(event.headers?.origin || event.headers?.Origin || '').trim();
-  const allowed = String(process.env.ALLOWED_ORIGIN || '').trim();
+  const allowed = String(process.env.ALLOWED_ORIGIN || '').split(',').map(x => x.trim()).filter(Boolean);
   if (!origin) return true;
-  if (allowed) return origin === allowed;
+  if (allowed.length) return allowed.includes(origin);
   return process.env.NODE_ENV !== 'production';
 }
 
@@ -125,17 +125,24 @@ async function createSession(req, client) {
 }
 
 async function upsertTelegramUser(tg, client) {
-  const superAdminId = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '801812169').trim();
+  const superAdminId = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '').trim();
   const configuredSuperAdmin = superAdminId && String(tg.id) === superAdminId;
   const existing = await client.query(`SELECT * FROM users WHERE telegram_id=$1`, [tg.id]);
-  let role = configuredSuperAdmin ? 'super_admin' : (existing.rows[0]?.role === 'sub_admin' ? 'sub_admin' : 'user');
+  let role = configuredSuperAdmin ? 'super_admin' : (['super_admin','sub_admin'].includes(existing.rows[0]?.role) ? existing.rows[0].role : 'user');
   const { rows } = await client.query(`INSERT INTO users(telegram_id, username, first_name, last_name, role) VALUES($1,$2,$3,$4,$5) ON CONFLICT(telegram_id) DO UPDATE SET username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name, role=EXCLUDED.role, updated_at=NOW() RETURNING *`, [tg.id, tg.username || null, tg.first_name || null, tg.last_name || null, role]);
   await client.query(`INSERT INTO wallets(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING`, [rows[0].id]);
   return rows[0];
 }
 
 async function auth(req, client) {
-  return authFromSession(req, client);
+  const sessionUser = await authFromSession(req, client);
+  if (sessionUser) return sessionUser;
+  // Fallback for embedded Telegram WebViews where cross-site session cookies
+  // may be unavailable. The Telegram payload is cryptographically verified
+  // and then mapped to the existing server-side user.
+  const tg = verifyTelegramInitData(req.headers['x-telegram-init-data'] || req.headers['X-Telegram-Init-Data']);
+  if (!tg?.id) return null;
+  return upsertTelegramUser(tg, client);
 }
 
 function isAdmin(user) { return user?.role === 'sub_admin' || user?.role === 'super_admin'; }
@@ -473,9 +480,27 @@ export async function handler(event) {
         const telegramId = body.telegramId ? String(body.telegramId).trim() : '';
         const username = body.username ? String(body.username).trim().replace(/^@/,'') : '';
         if (!telegramId && !username) return json(400,{error:'telegramId or username is required.'});
-        const found = await client.query(`SELECT * FROM users WHERE ${telegramId ? 'telegram_id=$1' : 'LOWER(COALESCE(username,\'\'))=LOWER($1)'}`, [telegramId || username]);
-        if (!found.rows[0]) return json(404,{error:'User must open the Mini App once before being promoted to sub admin.'});
-        const target=found.rows[0];
+        let target;
+        if (telegramId) {
+          const found = await client.query(`SELECT * FROM users WHERE telegram_id=$1`, [telegramId]);
+          if (found.rows[0]) {
+            target = found.rows[0];
+          } else {
+            // Super Admin may provision a Sub Admin by Telegram ID before that
+            // person opens the Mini App. This creates the identity server-side;
+            // the person still must authenticate in Telegram to use it.
+            const created = await client.query(
+              `INSERT INTO users(telegram_id,username,role) VALUES($1,$2,'sub_admin') RETURNING *`,
+              [telegramId, username || null]
+            );
+            target = created.rows[0];
+            await client.query(`INSERT INTO wallets(user_id) VALUES($1) ON CONFLICT(user_id) DO NOTHING`, [target.id]);
+          }
+        } else {
+          const found = await client.query(`SELECT * FROM users WHERE LOWER(COALESCE(username,''))=LOWER($1)`, [username]);
+          if (!found.rows[0]) return json(404,{error:'User not found. Add the Telegram numeric ID instead.'});
+          target = found.rows[0];
+        }
         if (target.role === 'super_admin') return json(400,{error:'A super admin cannot be converted to sub admin.'});
         const permissions = body.permissions && typeof body.permissions === 'object' ? body.permissions : {dashboard_view:true,users_view:true,wallet_manage:true,reward_manage:false,game_manage:false};
         await client.query('BEGIN');
@@ -520,7 +545,21 @@ export async function handler(event) {
         const elapsed = Math.floor((Date.now() - new Date(r.rows[0].pick_started_at).getTime()) / 1000);
         if (elapsed >= PICK_WINDOW_SECONDS) {
           const picked = await client.query(`SELECT COUNT(*)::int AS count FROM game_cards WHERE game_id=$1`, [r.rows[0].id]);
-          if (Number(picked.rows[0]?.count || 0) === 0) {
+          const pickedCount = Number(picked.rows[0]?.count || 0);
+          if (pickedCount > 0) {
+            // The round is global. Its transition to LIVE must be decided by
+            // the server, not by a browser's localStorage. This guarantees
+            // every Telegram user joins the exact same round/countdown.
+            r = await client.query(
+              `UPDATE games
+               SET status='running', started_at=COALESCE(started_at,NOW()),
+                   next_call_at=COALESCE(next_call_at,NOW()), last_activity_at=NOW(),
+                   ended_reason=NULL
+               WHERE id=$1 AND status='picking'
+               RETURNING id,game_type,stake,reward_rate,status,created_at,pick_started_at,started_at,called_numbers,call_index,next_call_at,winner_count`,
+              [r.rows[0].id]
+            );
+          } else {
             await client.query(`UPDATE games SET pick_started_at=NOW(), last_activity_at=NOW(), called_numbers='[]'::jsonb, call_index=0, current_call=NULL, next_call_at=NULL, winner_count=0, ended_reason=NULL, settled_at=NULL WHERE id=$1`, [r.rows[0].id]);
             r = await client.query(`SELECT id,game_type,stake,reward_rate,status,created_at,pick_started_at,started_at,called_numbers,call_index,next_call_at,winner_count FROM games WHERE id=$1`, [r.rows[0].id]);
           }
@@ -625,7 +664,8 @@ export async function handler(event) {
       const gameId = String(event.queryStringParameters?.gameId || '').trim();
       if (!gameId) return json(400,{error:'gameId is required.'});
       const r = await client.query(`SELECT card_number,user_id FROM game_cards WHERE game_id=$1 ORDER BY card_number`, [gameId]);
-      return json(200,{cards:r.rows});
+      const cards = r.rows.map(row => ({ card_number:Number(row.card_number), user_id:Number(row.user_id), mine:Number(row.user_id) === Number(user.id) }));
+      return json(200,{cards, mineCards:cards.filter(c => c.mine).map(c => c.card_number)});
     }
 
     if (method === 'POST' && parts.at(-2) === 'games' && parts.at(-1) === 'start') {

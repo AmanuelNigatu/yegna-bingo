@@ -48,13 +48,13 @@ function menuKeyboard() {
 }
 
 async function upsertBotUser(tgUser, client) {
-  const role = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '801812169') === String(tgUser.id) ? 'super_admin' : 'user';
+  const role = String(process.env.SUPER_ADMIN_TELEGRAM_ID || '').trim() && String(process.env.SUPER_ADMIN_TELEGRAM_ID).trim() === String(tgUser.id) ? 'super_admin' : 'user';
   const r = await client.query(
     `INSERT INTO users(telegram_id,username,first_name,last_name,role)
      VALUES($1,$2,$3,$4,$5)
      ON CONFLICT(telegram_id) DO UPDATE SET
        username=EXCLUDED.username, first_name=EXCLUDED.first_name, last_name=EXCLUDED.last_name,
-       role=CASE WHEN users.role='sub_admin' THEN users.role ELSE EXCLUDED.role END,
+       role=CASE WHEN users.role IN ('super_admin','sub_admin') THEN users.role ELSE EXCLUDED.role END,
        updated_at=NOW()
      RETURNING *`,
     [tgUser.id, tgUser.username || null, tgUser.first_name || null, tgUser.last_name || null, role]

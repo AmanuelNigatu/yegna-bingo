@@ -203,6 +203,15 @@ function App() {
   const [serverWallet, setServerWallet] = useState(null);
   const balance = Number(serverWallet?.wallet?.balance ?? getWalletUser().balance ?? 0);
   const [session, setSession] = useState(() => getStoredState());
+  const [me, setMe] = useState(null);
+  const [meLoading, setMeLoading] = useState(true);
+
+  useEffect(() => {
+    let alive = true;
+    if (!isBackendConfigured()) return () => { alive = false; };
+    walletApi.getMe().then(data => { if (alive) setMe(data.user || null); }).catch(() => { if (alive) setMe(null); }).finally(() => { if (alive) setMeLoading(false); });
+    return () => { alive = false; };
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -236,6 +245,9 @@ function App() {
   const goHome = useCallback(() => navigate("/"), [navigate]);
   const goToBingo = useCallback((id) => navigate(`/bingo?stake=${id}`), [navigate]);
 
+  if (location.pathname === "/admin/wallet" && meLoading) return <div className="app-shell framed-page"><main className="wallet-main"><div className="empty-wallet"><RefreshCw size={27}/><p>Checking admin access…</p></div></main></div>;
+  if (location.pathname === "/admin/wallet" && (!me || !["super_admin", "sub_admin"].includes(me.role))) return <div className="app-shell framed-page"><main className="wallet-main"><div className="empty-wallet"><LockKeyhole size={30}/><p>Admin access is restricted to Super Admin and Sub Admin accounts.</p><button className="wallet-action" onClick={() => navigate("/")}>Back to Game</button></div></main></div>;
+
   if (location.pathname === "/game" && [1, 2].includes(gameId)) {
     return <CardPicker gameId={gameId} session={session} setSession={setSession} onBack={goHome} onWatch={() => goToBingo(gameId)} onNavigate={navigate} />;
   }
@@ -254,7 +266,7 @@ function App() {
         <div className="page-frame" aria-hidden="true" />
         <div className="wallet-page profile-page">
           <img className="small-logo" src={assetUrl("assets/yegna-logo.png")} alt="YEGNA BINGO" />
-          <div className="wallet-panel"><UserRound size={28}/><h1>Profile</h1><p>{getPlayerDisplayName()}</p><button className="wallet-action" onClick={() => navigate("/admin/wallet")}>Admin Wallet</button></div>
+          <div className="wallet-panel"><UserRound size={28}/><h1>Profile</h1><p>{getPlayerDisplayName()}</p>{(me?.role === "super_admin" || me?.role === "sub_admin") && <button className="wallet-action" onClick={() => navigate("/admin/wallet")}>Admin Wallet</button>}</div>
         </div>
         <BottomNav items={navItems} activeKey="profile" onNavigate={navigate} />
       </div>
@@ -313,10 +325,9 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
   const [notice, setNotice] = useState("");
   const [busyCard, setBusyCard] = useState(null);
   const [serverTakenCards, setServerTakenCards] = useState(new Set());
+  const [serverMyCards, setServerMyCards] = useState([]);
   const [serverRoundReady, setServerRoundReady] = useState(!isBackendConfigured());
-  const [round, setRound] = useState(() => {
-    return getOrCreateRound(gameId);
-  });
+  const [round, setRound] = useState(() => isBackendConfigured() ? { id:null, gameId, status:"picking", pickStartedAt:Date.now(), completedAt:null } : getOrCreateRound(gameId));
   useEffect(() => {
     if (!isBackendConfigured()) return;
     let alive = true;
@@ -337,7 +348,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
           if (prev.id === next.id && prev.status === next.status && prev.pickStartedAt === next.pickStartedAt) return prev;
           return next;
         });
-        writeRound(gameId, next);
+        if (!isBackendConfigured()) writeRound(gameId, next);
         if (next.status === "live") onWatch();
       } catch (e) {
         if (alive) {
@@ -352,21 +363,20 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
   }, [gameId, onWatch]);
 
   const [secondsLeft, setSecondsLeft] = useState(() => {
+    if (isBackendConfigured() && !round.id) return 35;
     const saved = readRound(gameId);
     if (!saved || saved.status === "complete") return 35;
     return Math.max(0, 35 - Math.floor((Date.now() - saved.pickStartedAt) / 1000));
   });
   const roundId = round.id;
-  const myCards = session.picked?.[gameId] || [];
+  const myCards = isBackendConfigured() ? serverMyCards : (session.picked?.[gameId] || []);
   const playerKey = getPlayerKey();
   const selectedRoom = session.roomId && session.roomId !== gameId ? session.roomId : null;
   const occupiedByOthers = useMemo(() => {
-    const registry = readPickedRegistryForRound(gameId, roundId);
-    const localTaken = new Set(Object.entries(registry).filter(([, owner]) => owner !== playerKey).map(([n]) => Number(n)));
-    serverTakenCards.forEach(n => localTaken.add(Number(n)));
-    myCards.forEach(n => localTaken.delete(Number(n)));
-    return localTaken;
-  }, [gameId, roundId, playerKey, myCards.length, serverTakenCards]);
+    const taken = isBackendConfigured() ? new Set(serverTakenCards) : new Set(Object.entries(readPickedRegistryForRound(gameId, roundId)).filter(([, owner]) => owner !== playerKey).map(([n]) => Number(n)));
+    myCards.forEach(n => taken.delete(Number(n)));
+    return taken;
+  }, [gameId, roundId, playerKey, myCards.join(","), serverTakenCards]);
 
   const visibleCards = useMemo(() => {
     const q = query.trim();
@@ -388,32 +398,42 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     }
     if (round.status === "complete") return;
 
-    const tick = () => {
-      const latest = readRound(gameId) || round;
+    const tick = async () => {
+      const latest = isBackendConfigured() ? round : (readRound(gameId) || round);
       const remaining = Math.max(0, 35 - Math.floor((Date.now() - latest.pickStartedAt) / 1000));
       setSecondsLeft(remaining);
       if (remaining <= 0) {
-        // A player may start with just ONE card. The round is global, so the
-        // decision is based on whether ANY user reserved at least one card.
+        if (isBackendConfigured()) {
+          // Production is fully server-authoritative. A browser must never use
+          // localStorage to decide whether another Telegram user picked a card.
+          try {
+            const result = await walletApi.getActiveRound(gameId);
+            const r = result?.round;
+            if (r) {
+              const next = {
+                id: r.id,
+                gameId,
+                status: r.status === "running" ? "live" : r.status === "settled" ? "complete" : "picking",
+                pickStartedAt: new Date(r.pick_started_at || r.created_at).getTime(),
+                completedAt: r.settled_at ? new Date(r.settled_at).getTime() : null
+              };
+              setRound(next);
+              if (next.status === "live") onWatch();
+            }
+          } catch (e) {
+            setNotice(e.message || "Game could not start. Please try again.");
+          }
+          return;
+        }
+
         const registry = readPickedRegistryForRound(gameId, latest.id);
         const anyCardsPicked = Object.keys(registry).length > 0;
-
         if (anyCardsPicked) {
-          const launch = async () => {
-            try {
-              if (isBackendConfigured()) await walletApi.startGame(latest.id);
-              const live = { ...latest, status: "live" };
-              writeRound(gameId, live);
-              setRound(live);
-              onWatch();
-            } catch (e) {
-              setNotice(e.message || "Game could not start. Please try again.");
-            }
-          };
-          launch();
+          const live = { ...latest, status: "live" };
+          writeRound(gameId, live);
+          setRound(live);
+          onWatch();
         } else {
-          // Nobody picked anything: do not enter the Game page. Start a brand
-          // new 35-second picking window instead.
           const fresh = createRound(gameId);
           writeRound(gameId, fresh);
           setRound(fresh);
@@ -441,12 +461,12 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
   }, [gameId]);
 
   useEffect(() => {
-    if (!isBackendConfigured()) return;
+    if (!isBackendConfigured() || !roundId) return;
     let alive = true;
     const load = async () => {
       try {
         const result = await walletApi.getGameCards(roundId);
-        if (alive) setServerTakenCards(new Set((result.cards || []).map(c => Number(c.card_number))));
+        if (alive) { setServerTakenCards(new Set((result.cards || []).map(c => Number(c.card_number)))); setServerMyCards((result.mineCards || []).map(Number)); }
       } catch {}
     };
     load();
@@ -473,8 +493,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
       setNotice(`You already joined ${GAMES.find(g => g.id === session.roomId)?.label}. Finish that game before joining another.`);
       return;
     }
-    const latestRound = readRound(gameId) || round;
-    if (latestRound.status !== "picking") {
+    if (round.status !== "picking") {
       onWatch();
       return;
     }
@@ -490,11 +509,18 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
           await walletApi.releaseCard(roundId, cardNumber);
         }
         const next = myCards.filter(n => n !== cardNumber);
-        const registry = readPickedRegistryForRound(gameId, roundId);
-        if (registry[String(cardNumber)] === playerKey) delete registry[String(cardNumber)];
-        writePickedRegistryForRound(gameId, roundId, registry);
-        setServerTakenCards(prev => { const n = new Set(prev); n.delete(cardNumber); return n; });
-        setSession(s => ({ ...s, roomId: next.length ? gameId : null, picked: { ...(s.picked || {}), [gameId]: next } }));
+        if (isBackendConfigured()) {
+          const refreshed = await walletApi.getGameCards(roundId);
+          setServerTakenCards(new Set((refreshed.cards || []).map(c => Number(c.card_number))));
+          setServerMyCards((refreshed.mineCards || []).map(Number));
+          setSession(s => ({ ...s, roomId: (refreshed.mineCards || []).length ? gameId : null }));
+        } else {
+          const registry = readPickedRegistryForRound(gameId, roundId);
+          if (registry[String(cardNumber)] === playerKey) delete registry[String(cardNumber)];
+          writePickedRegistryForRound(gameId, roundId, registry);
+          setServerTakenCards(prev => { const n = new Set(prev); n.delete(cardNumber); return n; });
+          setSession(s => ({ ...s, roomId: next.length ? gameId : null, picked: { ...(s.picked || {}), [gameId]: next } }));
+        }
         setNotice(`Card #${cardNumber} released. 10 ETB stake refunded.`);
       } catch (e) {
         setNotice(e.message || "Card could not be released.");
@@ -509,25 +535,20 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     }
     setBusyCard(cardNumber);
     try {
-      const current = readRound(gameId) || round;
+      const current = isBackendConfigured() ? round : (readRound(gameId) || round);
       if (current.status !== "picking") { onWatch(); return; }
       if (isBackendConfigured()) {
         await walletApi.reserveStake(roundId, cardNumber, game.amount, gameId);
       }
-      const registry = readPickedRegistryForRound(gameId, roundId);
-      if (!registry[String(cardNumber)]) {
-        registry[String(cardNumber)] = playerKey;
-        savePlayerDisplayName(playerKey, getPlayerDisplayName());
-        writePickedRegistryForRound(gameId, roundId, registry);
-        setServerTakenCards(prev => new Set([...prev, cardNumber]));
-        setSession(s => ({ ...s, roomId: gameId, picked: { ...(s.picked || {}), [gameId]: [...(s.picked?.[gameId] || []), cardNumber] } }));
+      if (isBackendConfigured()) {
+        const refreshed = await walletApi.getGameCards(roundId);
+        setServerTakenCards(new Set((refreshed.cards || []).map(c => Number(c.card_number))));
+        setServerMyCards((refreshed.mineCards || []).map(Number));
+        setSession(s => ({ ...s, roomId: gameId }));
         setNotice(`Card #${cardNumber} reserved. ${game.amount} ETB stake deducted.`);
       } else {
-        // A concurrent local-tab race should never silently keep a server stake.
-        if (isBackendConfigured()) {
-          try { await walletApi.releaseCard(roundId, cardNumber); } catch {}
-        }
-        setNotice(`Card #${cardNumber} is already picked.`);
+        const registry = readPickedRegistryForRound(gameId, roundId);
+        if (!registry[String(cardNumber)]) { registry[String(cardNumber)] = playerKey; savePlayerDisplayName(playerKey, getPlayerDisplayName()); writePickedRegistryForRound(gameId, roundId, registry); setServerTakenCards(prev => new Set([...prev, cardNumber])); setSession(s => ({ ...s, roomId: gameId, picked: { ...(s.picked || {}), [gameId]: [...(s.picked?.[gameId] || []), cardNumber] } })); setNotice(`Card #${cardNumber} reserved. ${game.amount} ETB stake deducted.`); }
       }
     } catch (e) {
       setNotice(e.message || "Card selection failed.");
@@ -555,6 +576,8 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
     setSession(s => ({ ...s, roomId: null, picked: { ...(s.picked || {}), [gameId]: [] } }));
     setNotice(`Your selected cards were released and ${myCards.length * game.amount} ETB refunded.`);
   }
+
+  if (isBackendConfigured() && !roundId) return <div className="app-shell framed-page picker-page"><main className="picker-main"><div className="empty-wallet"><RefreshCw size={27}/><p>{notice || "Connecting to the game server…"}</p></div></main></div>;
 
   return (
     <div className="app-shell framed-page picker-page">
@@ -651,12 +674,28 @@ function callerAudioUrl(name) {
 
 function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }) {
   const game = GAMES.find(g => g.id === gameId);
-  const myCards = session.picked?.[gameId] || [];
+  const [serverMyCards, setServerMyCards] = useState([]);
+  const myCards = isBackendConfigured() ? serverMyCards : (session.picked?.[gameId] || []);
   // Resolve the round BEFORE any hook that depends on it. The previous build
   // referenced `round.id` inside useMemo before `round` was initialized,
   // causing a ReferenceError and leaving the Game page completely blank.
-  const [round, setRound] = useState(() => getOrCreateRound(gameId));
+  const [round, setRound] = useState(() => isBackendConfigured() ? { id:null, gameId, status:"picking", pickStartedAt:Date.now(), completedAt:null } : getOrCreateRound(gameId));
   const roundId = round.id;
+  useEffect(() => {
+    if (!isBackendConfigured()) return;
+    let alive = true;
+    const sync = async () => {
+      try {
+        const active = await walletApi.getActiveRound(gameId);
+        const r = active?.round;
+        if (!alive || !r) return;
+        setRound({ id:r.id, gameId, status:r.status === "running" ? "live" : r.status === "settled" ? "complete" : "picking", pickStartedAt:new Date(r.pick_started_at || r.created_at).getTime() });
+        const cards = await walletApi.getGameCards(r.id);
+        if (alive) setServerMyCards((cards.mineCards || []).map(Number));
+      } catch {}
+    };
+    sync(); const timer=setInterval(sync,1000); return () => { alive=false; clearInterval(timer); };
+  }, [gameId]);
   const cards = useMemo(() => {
     const nums = new Set(myCards);
     const savedWinner = (() => { try { return JSON.parse(localStorage.getItem(`yegna-bingo-winner-${gameId}-${roundId}`) || "null"); } catch { return null; } })();
@@ -665,7 +704,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
   }, [gameId, myCards.join(","), roundId]);
   const callsKey = `yegna-bingo-calls-${gameId}-${roundId}`;
   const winnerKey = `yegna-bingo-winner-${gameId}-${roundId}`;
-  const [pickedCount, setPickedCount] = useState(() => roundId ? Object.keys(readPickedRegistryForRound(gameId, roundId)).length : 0);
+  const [pickedCount, setPickedCount] = useState(() => (isBackendConfigured() ? 0 : (roundId ? Object.keys(readPickedRegistryForRound(gameId, roundId)).length : 0)));
   const [called, setCalled] = useState(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(callsKey) || "null");
@@ -696,6 +735,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
   // Keep the LIVE page synchronized with the current round when opened
   // directly or from another tab.
   useEffect(() => {
+    if (isBackendConfigured()) return;
     const syncRound = () => {
       const latest = readRound(gameId);
       if (latest && latest.id === roundId && (latest.status !== round.status || latest.pickStartedAt !== round.pickStartedAt)) {
@@ -1150,6 +1190,8 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
     setGlobalWinner(null);
   }
 
+  if (isBackendConfigured() && !roundId) return <div className="app-shell framed-page bingo-page"><main className="game-main"><div className="empty-wallet"><RefreshCw size={27}/><p>Connecting to the global game…</p></div></main></div>;
+
   return (
     <div className="app-shell framed-page bingo-page">
       <div className="page-frame" aria-hidden="true" />
@@ -1360,8 +1402,10 @@ function AdminWalletPage({ onNavigate }) {
   const [adminAccess,setAdminAccess]=useState(null); const [subAdmins,setSubAdmins]=useState([]); const [subAdminInput,setSubAdminInput]=useState(""); const [subAdminBusy,setSubAdminBusy]=useState(false); const [subAdminMessage,setSubAdminMessage]=useState("");
   const [walletRequests,setWalletRequests]=useState([]); const [requestFilter,setRequestFilter]=useState("pending"); const [requestBusy,setRequestBusy]=useState(false); const [requestMessage,setRequestMessage]=useState("");
   const [serverUsers,setServerUsers]=useState([]); const [serverStats,setServerStats]=useState(null); const [selectedWallet,setSelectedWallet]=useState(null);
-  const users=serverUsers.length ? serverUsers.filter(u=>(u.username||"").toLowerCase().includes(query.toLowerCase()) || String(u.telegram_id||"").includes(query.replace(/^@/,""))) : Object.values(store).filter(u=>(u.username||"").toLowerCase().includes(query.toLowerCase()) || (u.userKey||"").toLowerCase().includes(query.toLowerCase()));
-  const allUsers=serverUsers.length ? serverUsers : Object.values(store);
+  const [accessChecked,setAccessChecked]=useState(!isBackendConfigured());
+  const [accessDenied,setAccessDenied]=useState(false);
+  const users=isBackendConfigured() ? serverUsers.filter(u=>(u.username||"").toLowerCase().includes(query.toLowerCase()) || String(u.telegram_id||"").includes(query.replace(/^@/,""))) : Object.values(store).filter(u=>(u.username||"").toLowerCase().includes(query.toLowerCase()) || (u.userKey||"").toLowerCase().includes(query.toLowerCase()));
+  const allUsers=isBackendConfigured() ? serverUsers : Object.values(store);
   const allTx=allUsers.flatMap(u=>u.transactions||[]);
   const totalBalance=serverStats ? Number(serverStats.balance||0) : allUsers.reduce((n,u)=>n+Number(u.balance||0),0);
   const totalStakes=serverStats ? Number(serverStats.stakes||0) : Math.abs(allTx.filter(t=>Number(t.amount)<0 && t.type==="stake").reduce((n,t)=>n+Number(t.amount||0),0));
@@ -1386,7 +1430,7 @@ function AdminWalletPage({ onNavigate }) {
     try { if(isBackendConfigured()) await walletApi.setRewardRate(n); else localStorage.setItem(REWARD_KEY,String(n)); setRate(n); setRequestMessage("Reward rate saved."); } catch(e){ setRequestMessage(e.message); }
   }
   const loadSubAdmins=async()=>{ try {
-    const access=await walletApi.getAdminAccess(); setAdminAccess(access);
+    const access=await walletApi.getAdminAccess(); setAdminAccess(access); setAccessDenied(!["super_admin","sub_admin"].includes(access?.user?.role)); setAccessChecked(true);
     if(access.user?.role==='super_admin') setSubAdmins((await walletApi.getSubAdmins()).subAdmins||[]);
     if(access.permissions?.reward_manage) {
       const settings=await walletApi.getAdminSettings();
@@ -1402,7 +1446,9 @@ function AdminWalletPage({ onNavigate }) {
   const addSubAdmin=async()=>{ if(!subAdminInput.trim())return; setSubAdminBusy(true);setSubAdminMessage(""); try { const isId=/^\d+$/.test(subAdminInput.trim()); await walletApi.addSubAdmin(isId?{telegramId:subAdminInput.trim()}:{username:subAdminInput.trim()}); setSubAdminInput(""); setSubAdmins((await walletApi.getSubAdmins()).subAdmins||[]); setSubAdminMessage("Sub admin added successfully."); } catch(e){setSubAdminMessage(e.message);} finally{setSubAdminBusy(false);} };
   const removeSubAdmin=async(id)=>{ if(!confirm("Remove this sub admin and return the account to normal user access?"))return; setSubAdminBusy(true);setSubAdminMessage(""); try { await walletApi.removeSubAdmin(id); setSubAdmins((await walletApi.getSubAdmins()).subAdmins||[]); setSubAdminMessage("Sub admin removed."); } catch(e){setSubAdminMessage(e.message);} finally{setSubAdminBusy(false);} };
   const togglePermission=async(admin,key)=>{ const next={...(admin.permissions||{}),[key]:!(admin.permissions||{})[key]}; setSubAdminBusy(true);setSubAdminMessage(""); try { await walletApi.updateSubAdminPermissions(admin.id,next); setSubAdmins(list=>list.map(x=>x.id===admin.id?{...x,permissions:next}:x)); } catch(e){setSubAdminMessage(e.message);} finally{setSubAdminBusy(false);} };
-  const permissionLabels={dashboard_view:"Dashboard",users_view:"Users",wallet_manage:"Wallet",reward_manage:"Reward",game_manage:"Game"};
+  if (!accessChecked) return <div className="app-shell framed-page"><main className="wallet-main"><div className="empty-wallet"><RefreshCw size={27}/><p>Checking admin access…</p></div></main></div>;
+  if (accessDenied) return <div className="app-shell framed-page"><main className="wallet-main"><div className="empty-wallet"><LockKeyhole size={30}/><p>Admin access is restricted to Super Admin and Sub Admin accounts.</p><button className="wallet-action" onClick={()=>onNavigate("/")}>Back to Game</button></div></main></div>;
+    const permissionLabels={dashboard_view:"Dashboard",users_view:"Users",wallet_manage:"Wallet",reward_manage:"Reward",game_manage:"Game"};
   return <div className="app-shell framed-page wallet-page-shell"><div className="page-frame" aria-hidden="true"/><header className="simple-page-header"><button className="header-back" onClick={()=>onNavigate("/")}><ArrowLeft size={21}/></button><div><img src={assetUrl("assets/yegna-logo.png")}/><span>ADMIN · WALLET MANAGEMENT</span></div><Crown size={24}/></header><main className="wallet-main admin-main">
     <section className="admin-stats"><div><b>{serverStats?.users ?? allUsers.length}</b><span>Total Users</span></div><div><b>{totalBalance.toFixed(2)}</b><span>Total Balance</span></div><div><b>{totalDeposits.toFixed(2)}</b><span>Total Deposits</span></div><div><b>{totalWithdrawals.toFixed(2)}</b><span>Total Withdrawals</span></div><div><b>{totalStakes.toFixed(2)}</b><span>Total Stakes</span></div><div><b>{totalRewards.toFixed(2)}</b><span>Rewards Paid</span></div></section>
     <section className="admin-card wallet-requests-card"><div className="panel-title"><RefreshCw size={19}/><h2>Deposit / Withdraw Approval</h2></div><p>Review wallet requests submitted through the Telegram Bot. Balance changes happen only after approval.</p><div className="request-tabs"><button className={requestFilter==="pending"?"active":""} onClick={()=>setRequestFilter("pending")}>Pending</button><button className={requestFilter==="approved"?"active":""} onClick={()=>setRequestFilter("approved")}>Approved</button><button className={requestFilter==="rejected"?"active":""} onClick={()=>setRequestFilter("rejected")}>Rejected</button><button className="request-refresh" onClick={loadWalletRequests} disabled={requestBusy}><RefreshCw size={15}/></button></div>{requestMessage&&<small className="subadmin-message">{requestMessage}</small>}<div className="wallet-request-list">{walletRequests.map(r=><div className={`wallet-request-row ${r.status}`} key={r.id}><div className="wallet-request-head"><span><b>{r.type==='deposit'?'DEPOSIT':'WITHDRAW'}</b><small>@{r.username||'YEGNA User'} · Telegram ID: {r.telegram_id}</small></span><strong>{Number(r.amount).toFixed(2)} ETB</strong></div><div className="wallet-request-meta"><span>#{r.id} · {new Date(r.requested_at).toLocaleString()}</span><span>{r.method||'Telegram Bot'}</span></div>{r.detail&&<div className="wallet-request-detail">{r.detail}</div>}{r.status==='pending'&&<div className="request-actions"><button onClick={()=>approveRequest(r.id)} disabled={requestBusy}>Approve</button><button className="danger" onClick={()=>rejectRequest(r.id)} disabled={requestBusy}>Reject</button></div>}{r.status!=='pending'&&<div className="request-status">{r.status.toUpperCase()}{r.rejection_reason?` · ${r.rejection_reason}`:''}</div>}</div>)}{!walletRequests.length&&<div className="empty-wallet"><RefreshCw size={27}/><p>No {requestFilter} wallet requests.</p></div>}</div></section>
