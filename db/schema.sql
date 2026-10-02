@@ -61,7 +61,6 @@ CREATE TABLE IF NOT EXISTS games (
   settled_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS games_type_status_idx ON games(game_type,status,created_at DESC);
-CREATE UNIQUE INDEX IF NOT EXISTS games_single_global_active_idx ON games ((1)) WHERE status IN ('picking','running');
 
 CREATE TABLE IF NOT EXISTS game_cards (
   id BIGSERIAL PRIMARY KEY,
