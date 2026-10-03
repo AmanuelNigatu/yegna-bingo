@@ -28,7 +28,25 @@ function corsHeaders(origin) {
 
 function json(status, body, extraHeaders = {}, origin = '') {
   const requestId = crypto.randomUUID();
-  return { statusCode: status, headers: { 'Content-Type': 'application/json', 'X-Request-Id': requestId, ...corsHeaders(origin), ...extraHeaders }, body: JSON.stringify(body) };
+
+  const configuredOrigins = String(process.env.ALLOWED_ORIGIN || '')
+    .split(',')
+    .map(x => x.trim())
+    .filter(Boolean);
+
+  const resolvedOrigin =
+    origin || (configuredOrigins.length === 1 ? configuredOrigins[0] : '');
+
+  return {
+    statusCode: status,
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Request-Id': requestId,
+      ...corsHeaders(resolvedOrigin),
+      ...extraHeaders
+    },
+    body: JSON.stringify(body)
+  };
 }
 
 function originAllowed(event) {
