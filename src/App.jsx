@@ -358,7 +358,7 @@ function CardPicker({ gameId, session, setSession, onBack, onWatch, onNavigate }
       }
     };
     sync();
-    const timer = setInterval(sync, 1000);
+    const timer = setInterval(sync, 1500);
     return () => { alive = false; clearInterval(timer); };
   }, [gameId, onWatch]);
 
@@ -694,7 +694,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
         if (alive) setServerMyCards((cards.mineCards || []).map(Number));
       } catch {}
     };
-    sync(); const timer=setInterval(sync,1000); return () => { alive=false; clearInterval(timer); };
+    sync(); const timer=setInterval(sync,1500); return () => { alive=false; clearInterval(timer); };
   }, [gameId]);
   const cards = useMemo(() => {
     const nums = new Set(myCards);
