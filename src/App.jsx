@@ -795,6 +795,7 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
   const playedStartRef = useRef(false);
   const playedEndRef = useRef(false);
   const spokenCallRef = useRef(null);
+  const initialCallLoadedRef = useRef(false);
 
   // Preload the caller clips so the number voice can start with almost no
   // network/file-fetch delay when the number appears on screen.
@@ -899,10 +900,19 @@ function BingoGame({ gameId, session, setSession, onBack, onNavigate, navItems }
   }, [roundStatus, sound, playAudioFile]);
 
   useEffect(() => {
-    if (!sound || !current || current === spokenCallRef.current) return;
+  if (!sound || !current) return;
+
+  if (!initialCallLoadedRef.current) {
+    initialCallLoadedRef.current = true;
     spokenCallRef.current = current;
-    speakCall(current);
-  }, [current, sound, speakCall]);
+    return;
+  }
+
+  if (current === spokenCallRef.current) return;
+
+  spokenCallRef.current = current;
+  speakCall(current);
+}, [current, sound, speakCall]);
 
   // Keep open tabs in the same browser synchronized. A real Telegram
   // multiplayer game should replace this storage transport with a backend/WebSocket.
