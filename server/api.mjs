@@ -14,7 +14,7 @@ function corsHeaders(origin) {
   const allowed = String(process.env.ALLOWED_ORIGIN || '').split(',').map(x => x.trim()).filter(Boolean);
   const headers = {
     'Access-Control-Allow-Headers': 'Content-Type, X-Telegram-Init-Data, X-Wallet-Bot-Secret',
-    'Access-Control-Allow-Methods': 'GET,POST,PUT,OPTIONS',
+    'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
     'Access-Control-Allow-Credentials': 'true',
     'Vary': 'Origin'
   };
@@ -69,7 +69,7 @@ function logEvent(event, data = {}) {
 }
 const SESSION_COOKIE = 'yegna_session';
 const PICK_WINDOW_SECONDS = 35;
-const CALL_INTERVAL_MS = 4000;
+const CALL_INTERVAL_MS = 4300;
 const MAX_CATCH_UP_CALLS = 20;
 const SESSION_TTL_SECONDS = Number(process.env.SESSION_TTL_SECONDS || 86400);
 function cookieValue(event, name) {
